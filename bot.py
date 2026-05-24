@@ -1,377 +1,327 @@
-import os
+import telebot
+from telebot import types
 import sqlite3
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+import threading
+import os
+from flask import Flask
+from threading import Thread
 
-# Telegram Bot Token va Admin ID
-TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = 7180864511  # Siz taqdim etgan Admin ID
+# 🌐 TOKEN VA ADMIN MA'LUMOTLARI
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHIEF_ADMIN_ID = 7180864511  # Sizning Telegram ID raqamingiz
 
-bot = Bot(token=TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+if not BOT_TOKEN:
+    raise ValueError("Xatolik: Serverda 'BOT_TOKEN' topilmadi! Environment Variables qismini tekshiring.")
 
-# Baza bilan ishlash
-conn = sqlite3.connect("nakrutka.db")
-cursor = conn.cursor()
+bot = telebot.TeleBot(BOT_TOKEN)
+lock = threading.Lock()
 
-# Jadvallarni yaratish va yangilash
-cursor.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
-cursor.execute('''CREATE TABLE IF NOT EXISTS users (user_id INT PRIMARY KEY, username TEXT, balance REAL DEFAULT 0.0)''')
-cursor.execute('''CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INT, service TEXT, amount INT, link TEXT, status TEXT DEFAULT 'Kutilmoqda')''')
-cursor.execute('''CREATE TABLE IF NOT EXISTS deposits (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INT, amount REAL, photo_id TEXT, status TEXT)''')
-conn.commit()
+# --- HOSTINGDA 30 MINUT QOTIB QOLMASLIGI UCHUN VEB-SERVER (FLASK) ---
+app = Flask('')
 
-# Standart sozlamalarga dastlabki karta raqamini kiritish
-cursor.execute("INSERT OR IGNORE INTO settings VALUES ('card', '8600000000000000')")
-conn.commit()
+@app.route('/')
+def home():
+    return "Nakrutka boti muvaffaqiyatli va faol ishlamoqda!"
 
-# Narxlar matritsasi (Obunachi va Kommentariya uchun asosiy narxlar)
-AMOUNTS = [100, 500, 1000, 5000, 10000, 15000, 50000, 100000]
-BASE_PRICES = {
-    100: 2000.0,
-    500: 5000.0,
-    1000: 9000.0,
-    5000: 25000.0,
-    10000: 40000.0,
-    15000: 55000.0,
-    50000: 130000.0,
-    100000: 210000.0
-}
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
 
-def calculate_price(service, amount):
-    base = BASE_PRICES.get(amount, 10000.0)
-    if service in ['obunachi', 'komentariya']:
-        return base
-    elif service == 'layk':
-        return base / 2  # Yarim narx
-    elif service == 'korish':
-        return round(base / 3, 2)  # 3/1 narx
-    return base
+def keep_alive():
+    t = Thread(target=run_flask)
+    t.start()
 
-# FSM (Holatlar)
-class AdminStates(StatesGroup):
-    set_card = State()
+# --- MA'LUMOTLAR BAZASI (SKRINSHOTDAGI XATOLIK TUZATILGAN VERSIYA) ---
+def init_db():
+    with lock:
+        # Skrinshottagi eski baza xatosini tuzatish uchun yangi v2 baza yaratamiz
+        conn = sqlite3.connect("nakrutka_v2.db")
+        cursor = conn.cursor()
+        
+        # Foydalanuvchilar jadvali
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY
+            )
+        """)
+        # Adminlar jadvali
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY
+            )
+        """)
+        # Majburiy kanallar jadvali
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS channels (
+                channel_id TEXT PRIMARY KEY,
+                channel_url TEXT
+            )
+        """)
+        # Buyurtmalar yoki xizmatlar uchun namuna jadval
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                service TEXT,
+                amount INTEGER,
+                status TEXT DEFAULT 'Kutilmoqda'
+            )
+        """)
+        
+        # Asosiy adminni bazaga qo'shish
+        cursor.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (CHIEF_ADMIN_ID,))
+        conn.commit()
+        conn.close()
 
-class UserStates(StatesGroup):
-    deposit_amount = State()
-    deposit_check = State()
-    get_link = State()
+init_db()
 
-# --- KLAVIATURALAR ---
-def main_menu(user_id):
-    kb = [
-        [KeyboardButton(text="👤 Shaxsiy Kabinet / Balans"), KeyboardButton(text="📦 Mening buyurtmalarim")],
-        [KeyboardButton(text="👤 Obunachi qo'shish"), KeyboardButton(text="❤️ Layk ko'paytirish")],
-        [KeyboardButton(text="👁 Ko'rishlarni ko'paytirish"), KeyboardButton(text="💬 Kommentariyalar")]
-    ]
-    if user_id == ADMIN_ID:
-        kb.append([KeyboardButton(text="⚙️ Admin Panel")])
-    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+# --- BAZA BILAN ISHLASH FUNKSIYALARI ---
+def add_user(user_id):
+    with lock:
+        conn = sqlite3.connect("nakrutka_v2.db")
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+        conn.close()
 
-def cancel_menu():
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="❌ Bekor qilish")]],
-        resize_keyboard=True
+def get_users_count():
+    with lock:
+        conn = sqlite3.connect("nakrutka_v2.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users")
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count
+
+def get_all_users():
+    with lock:
+        conn = sqlite3.connect("nakrutka_v2.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM users")
+        users = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        return users
+
+def is_admin(user_id):
+    with lock:
+        conn = sqlite3.connect("nakrutka_v2.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,))
+        res = cursor.fetchone()
+        conn.close()
+        return res is not None
+
+def add_admin_db(user_id):
+    with lock:
+        conn = sqlite3.connect("nakrutka_v2.db")
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+        conn.close()
+
+def add_channel_db(ch_id, url):
+    with lock:
+        conn = sqlite3.connect("nakrutka_v2.db")
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO channels (channel_id, channel_url) VALUES (?, ?)", (ch_id, url))
+        conn.commit()
+        conn.close()
+
+def get_channels():
+    with lock:
+        conn = sqlite3.connect("nakrutka_v2.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT channel_id, channel_url FROM channels")
+        data = cursor.fetchall()
+        conn.close()
+        return data
+
+def delete_channel_db(ch_id):
+    with lock:
+        conn = sqlite3.connect("nakrutka_v2.db")
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM channels WHERE channel_id = ?", (ch_id,))
+        conn.commit()
+        conn.close()
+
+# --- MAJBURIY OBUNA TEKSHIRUVI ---
+def check_sub(user_id):
+    channels = get_channels()
+    if not channels:
+        return True
+    
+    for ch_id, _ in channels:
+        try:
+            member = bot.get_chat_member(ch_id, user_id)
+            if member.status in ['left', 'kicked']:
+                return False
+        except Exception:
+            continue
+    return True
+
+def send_sub_keyboard(message):
+    channels = get_channels()
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for i, (_, url) in enumerate(channels, 1):
+        markup.add(types.InlineKeyboardButton(text=f"🔗 {i}-kanalga obuna bo'lish", url=url))
+    markup.add(types.InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="check_sub_status"))
+    
+    bot.send_message(
+        message.chat.id, 
+        "🔴 <b>Botdan foydalanish uchun quyidagi kanallarimizga obuna bo'ling!</b>", 
+        reply_markup=markup, 
+        parse_mode="HTML"
     )
 
-def admin_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Karta raqamni o'zgartirish", callback_data="admin_card")],
-        [InlineKeyboardButton(text="📥 To'lovlar bo'limi", callback_data="admin_deposits_menu")],
-        [InlineKeyboardButton(text="📦 Buyurtmalar boshqaruvi", callback_data="admin_orders_menu")],
-        [InlineKeyboardButton(text="📊 Statistika", callback_data="admin_stats")]
-    ])
+# --- KLAVIATURALAR ---
+def main_keyboard():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add("🚀 Nakrutka buyurish", "💰 Balans")
+    markup.add("📊 Buyurtmalarim", "ℹ️ Yordam")
+    return markup
 
-# --- GLOBAL GLOBAL GLOBAL BEKOR QILISH HANDLERI ---
-@dp.message(F.text == "❌ Bekor qilish")
-async def cancel_handler(message: types.Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state is not None:
-        await state.clear()
-    await message.answer("❌ Jarayon bekor qilindi. Asosiy menyuga qaytdingiz.", reply_markup=main_menu(message.from_user.id))
+def admin_keyboard():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add("📊 Statistika", "📢 Reklama yuborish")
+    markup.add("➕ Kanal qo'shish", "❌ Kanalni o'chirish")
+    markup.add("➕ Admin qo'shish", "🏠 Chiqish")
+    return markup
 
-# --- ADMIN HANDLERS ---
-@dp.message(F.text == "⚙️ Admin Panel")
-async def open_admin_panel(message: types.Message):
-    if message.from_user.id != ADMIN_ID: return
-    await message.answer("⚙️ *Admin panelga xush kelibsiz!*", reply_markup=admin_menu(), parse_mode="Markdown")
-
-@dp.callback_query(F.data == "admin_card")
-async def admin_card_edit(call: types.CallbackQuery, state: FSMContext):
-    cursor.execute("SELECT value FROM settings WHERE key='card'")
-    current_card = cursor.fetchone()[0]
-    await call.message.answer(f"Hozirgi karta: `{current_card}`\nYangi karta raqamini yuboring:", reply_markup=cancel_menu(), parse_mode="Markdown")
-    await state.set_state(AdminStates.set_card)
-
-@dp.message(AdminStates.set_card)
-async def save_card(message: types.Message, state: FSMContext):
-    cursor.execute("UPDATE settings SET value=? WHERE key='card'", (message.text,))
-    conn.commit()
-    await message.answer("✅ Karta raqami yangilandi!", reply_markup=main_menu(ADMIN_ID))
-    await state.clear()
-
-# To'lovlar (Deposits) boshqaruvi
-@dp.callback_query(F.data == "admin_deposits_menu")
-async def admin_deposits_menu(call: types.CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏳ Kutilayotgan to'lovlar", callback_data="dep_status_Kutilmoqda")],
-        [InlineKeyboardButton(text="✅ Tasdiqlangan to'lovlar", callback_data="dep_status_Tasdiqlandi")],
-        [InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_admin")]
-    ])
-    await call.message.edit_text("📥 *To'lovlar bo'limi:*", reply_markup=kb, parse_mode="Markdown")
-
-@dp.callback_query(F.data == "back_to_admin")
-async def back_to_admin(call: types.CallbackQuery):
-    await call.message.edit_text("⚙️ *Admin panelga xush kelibsiz!*", reply_markup=admin_menu(), parse_mode="Markdown")
-
-@dp.callback_query(F.data.startswith("dep_status_"))
-async def show_deposits(call: types.CallbackQuery):
-    status = call.data.split("_")[2]
-    cursor.execute("SELECT id, user_id, amount FROM deposits WHERE status=?", (status,))
-    deps = cursor.fetchall()
-    if not deps:
-        await call.answer("Bu bo'limda to'lovlar mavjud emas.", show_alert=True)
+# --- BUYRUQLAR ---
+@bot.message_handler(commands=['start'])
+def start_cmd(message):
+    add_user(message.chat.id)
+    if not check_sub(message.chat.id):
+        send_sub_keyboard(message)
         return
-    kb = InlineKeyboardMarkup(inline_keyboard=[])
-    for dep_id, u_id, amount in deps:
-        kb.inline_keyboard.append([InlineKeyboardButton(text=f"ID: {dep_id} | Foydalanuvchi: {u_id} | {amount} so'm", callback_data=f"view_dep_{dep_id}")])
-    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin_deposits_menu")])
-    await call.message.edit_text(f"📥 *{status}* to'lovlar ro'yxati:", reply_markup=kb, parse_mode="Markdown")
+        
+    bot.send_message(
+        message.chat.id,
+        f"👋 <b>Salom, {message.from_user.first_name}!</b>\n\n"
+        f"🤖 SMM Nakrutka botimizga xush kelibsiz.\n"
+        f"Pastdagi menyudan foydalanib xizmatlarni tanlang:",
+        reply_markup=main_keyboard(),
+        parse_mode="HTML"
+    )
 
-@dp.callback_query(F.data.startswith("view_dep_"))
-async def view_deposit(call: types.CallbackQuery):
-    dep_id = call.data.split("_")[2]
-    cursor.execute("SELECT user_id, amount, photo_id, status FROM deposits WHERE id=?", (dep_id,))
-    dep = cursor.fetchone()
-    if dep:
-        user_id, amount, photo_id, status = dep
-        caption = f"💵 *To'lov #{dep_id}*\n\n👤 Foydalanuvchi ID: `{user_id}`\n💰 Miqdor: *{amount} so'm*\n📊 Holati: *{status}*"
-        kb = InlineKeyboardMarkup(inline_keyboard=[])
-        if status == "Kutilmoqda":
-            kb.inline_keyboard.append([
-                InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"app_dep_{dep_id}"),
-                InlineKeyboardButton(text="❌ Rad etish", callback_data=f"rej_dep_{dep_id}")
-            ])
-        kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data=f"dep_status_{status}")])
-        await call.message.delete()
-        await bot.send_photo(ADMIN_ID, photo=photo_id, caption=caption, reply_markup=kb, parse_mode="Markdown")
+@bot.message_handler(commands=['panel'])
+def admin_panel(message):
+    if is_admin(message.chat.id):
+        bot.send_message(message.chat.id, "💼 Admin panelga xush kelibsiz!", reply_markup=admin_keyboard())
 
-@dp.callback_query(F.data.startswith("app_dep_"))
-async def app_dep(call: types.CallbackQuery):
-    dep_id = call.data.split("_")[2]
-    cursor.execute("SELECT user_id, amount, status FROM deposits WHERE id=?", (dep_id,))
-    dep = cursor.fetchone()
-    if dep and dep[2] == "Kutilmoqda":
-        user_id, amount, _ = dep
-        cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
-        cursor.execute("UPDATE deposits SET status = 'Tasdiqlandi' WHERE id = ?", (dep_id,))
-        conn.commit()
-        await call.message.edit_caption(caption=f"✅ To'lov #{dep_id} tasdiqlandi!")
-        try: await bot.send_message(user_id, f"🎉 To'lovingiz tasdiqlandi! Balansingizga *{amount} so'm* qo'shildi.")
-        except: pass
+# --- ADMIN PANEL FUNKSIYALARI ---
+@bot.message_handler(func=lambda msg: is_admin(msg.chat.id) and msg.text in ["📊 Statistika", "📢 Reklama yuborish", "➕ Kanal qo'shish", "❌ Kanalni o'chirish", "➕ Admin qo'shish", "🏠 Chiqish"])
+def admin_actions(message):
+    if message.text == "📊 Statistika":
+        count = get_users_count()
+        bot.send_message(message.chat.id, f"👥 Botdagi jami a'zolar soni: <b>{count} ta</b>", parse_mode="HTML")
+        
+    elif message.text == "📢 Reklama yuborish":
+        msg = bot.send_message(message.chat.id, "📝 Reklama xabarini (matn, rasm yoki video) yuboring:")
+        bot.register_next_step_handler(msg, send_reklama)
+        
+    elif message.text == "➕ Kanal qo'shish":
+        msg = bot.send_message(message.chat.id, "Kanal ID va havolasini quyidagi formatda yuboring:\n\n`-100123456789 https://t.me/kanal_link` \n\n(Eslatma: bot kanalda admin bo'lishi shart!)", parse_mode="HTML")
+        bot.register_next_step_handler(msg, add_channel)
+        
+    elif message.text == "❌ Kanalni o'chirish":
+        channels = get_channels()
+        if not channels:
+            bot.send_message(message.chat.id, "O'chirish uchun kanallar mavjud emas.")
+            return
+        text = "O'chirmoqchi bo'lgan kanal ID raqamini nusxalab qayta yuboring:\n\n"
+        for ch_id, url in channels:
+            text += f"🆔 `{ch_id}`\n🔗 {url}\n\n"
+        msg = bot.send_message(message.chat.id, text, parse_mode="HTML")
+        bot.register_next_step_handler(msg, delete_channel)
+        
+    elif message.text == "➕ Admin qo'shish":
+        if message.chat.id != CHIEF_ADMIN_ID:
+            bot.send_message(message.chat.id, "❌ Faqat asosiy admin yangi admin qo'sha oladi!")
+            return
+        msg = bot.send_message(message.chat.id, "Yangi adminning Telegram ID raqamini yuboring:")
+        bot.register_next_step_handler(msg, add_admin)
+        
+    elif message.text == "🏠 Chiqish":
+        bot.send_message(message.chat.id, "Admin paneldan chiqdingiz.", reply_markup=main_keyboard())
 
-@dp.callback_query(F.data.startswith("rej_dep_"))
-async def reject_dep(call: types.CallbackQuery):
-    dep_id = call.data.split("_")[2]
-    cursor.execute("SELECT user_id, status FROM deposits WHERE id=?", (dep_id,))
-    dep = cursor.fetchone()
-    if dep and dep[1] == "Kutilmoqda":
-        user_id = dep[0]
-        cursor.execute("UPDATE deposits SET status = 'Rad etildi' WHERE id = ?", (dep_id,))
-        conn.commit()
-        await call.message.edit_caption(caption=f"❌ To'lov #{dep_id} rad etildi.")
-        try: await bot.send_message(user_id, f"❌ Siz yuborgan chek #{dep_id} rad etildi.")
-        except: pass
+# --- KEYINGI QADAM ISHLOVCHILARI (ADMIN) ---
+def send_reklama(message):
+    users = get_all_users()
+    bot.send_message(message.chat.id, f"🚀 Reklama {len(users)} ta foydalanuvchiga yuborilmoqda...")
+    success = 0
+    for u_id in users:
+        try:
+            bot.copy_message(chat_id=u_id, from_chat_id=message.chat.id, message_id=message.message_id)
+            success += 1
+        except Exception:
+            continue
+    bot.send_message(message.chat.id, f"✅ Reklama yakunlandi.\nJami yuborildi: {success} ta foydalanuvchiga.")
 
-# Nakrutka Buyurtmalari (Orders) boshqaruvi
-@dp.callback_query(F.data == "admin_orders_menu")
-async def admin_orders_menu(call: types.CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏳ Kutilayotgan buyurtmalar", callback_data="ord_status_Kutilmoqda")],
-        [InlineKeyboardButton(text="🔄 Bajarilayotganlar", callback_data="ord_status_Bajarilmoqda")],
-        [InlineKeyboardButton(text="✅ Tugallanganlar", callback_data="ord_status_Tugallangan")],
-        [InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_admin")]
-    ])
-    await call.message.edit_text("📦 *Buyurtmalar boshqaruv bo'limi:*", reply_markup=kb, parse_mode="Markdown")
-
-@dp.callback_query(F.data.startswith("ord_status_"))
-async def show_orders_admin(call: types.CallbackQuery):
-    status = call.data.split("_")[2]
-    cursor.execute("SELECT id, user_id, service, amount FROM orders WHERE status=?", (status,))
-    ords = cursor.fetchall()
-    if not ords:
-        await call.answer("Ushbu bo'limda buyurtmalar yo'q.", show_alert=True)
-        return
-    kb = InlineKeyboardMarkup(inline_keyboard=[])
-    for o_id, u_id, svc, amt in ords:
-        kb.inline_keyboard.append([InlineKeyboardButton(text=f"#{o_id} | {svc} | {amt} ta", callback_data=f"view_ord_{o_id}")])
-    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin_orders_menu")])
-    await call.message.edit_text(f"📦 *{status}* holatidagi buyurtmalar:", reply_markup=kb, parse_mode="Markdown")
-
-@dp.callback_query(F.data.startswith("view_ord_"))
-async def view_order_admin(call: types.CallbackQuery):
-    o_id = call.data.split("_")[2]
-    cursor.execute("SELECT user_id, service, amount, link, status FROM orders WHERE id=?", (o_id,))
-    ord_info = cursor.fetchone()
-    if ord_info:
-        user_id, service, amount, link, status = ord_info
-        text = f"📦 *Buyurtma #{o_id}*\n\n👤 Foydalanuvchi: `{user_id}`\n🛠 Xizmat: *{service}*\n🔢 Miqdor: *{amount} ta*\n🔗 Havola: {link}\n📊 Holat: *{status}*"
-        kb = InlineKeyboardMarkup(inline_keyboard=[])
-        if status == "Kutilmoqda":
-            kb.inline_keyboard.append([InlineKeyboardButton(text="🔄 Bajarishni boshlash", callback_data=f"set_ord_Bajarilmoqda_{o_id}")])
-        if status == "Bajarilmoqda":
-            kb.inline_keyboard.append([InlineKeyboardButton(text="✅ Tugatish", callback_data=f"set_ord_Tugallangan_{o_id}")])
-        kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data=f"ord_status_{status}")])
-        await call.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
-
-@dp.callback_query(F.data.startswith("set_ord_"))
-async def change_order_status(call: types.CallbackQuery):
-    _, _, new_status, o_id = call.data.split("_")
-    cursor.execute("SELECT user_id, service, amount FROM orders WHERE id=?", (o_id,))
-    u_id, svc, amt = cursor.fetchone()
-    cursor.execute("UPDATE orders SET status=? WHERE id=?", (new_status, o_id))
-    conn.commit()
-    await call.message.edit_text(f"✅ Buyurtma #{o_id} holati *{new_status}* ga o'zgartirildi!", parse_mode="Markdown")
-    try: await bot.send_message(u_id, f"📦 Sizning #{o_id} raqamli buyurtmangiz (*{amt} ta {svc}*) holati o'zgardi:\n📊 Yangi holat: *{new_status}*", parse_mode="Markdown")
-    except: pass
-
-@dp.callback_query(F.data == "admin_stats")
-async def show_stats(call: types.CallbackQuery):
-    cursor.execute("SELECT COUNT(*) FROM users")
-    u_count = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM orders WHERE status='Tugallangan'")
-    o_count = cursor.fetchone()[0]
-    await call.message.answer(f"📊 *Bot statistikasi:*\n\n👥 Jami foydalanuvchilar: {u_count} ta\n✅ Muwaffaqiyatli tugallangan buyurtmalar: {o_count} ta", parse_mode="Markdown")
-
-
-# --- USER HANDLERS ---
-@dp.message(CommandStart())
-async def start_cmd(message: types.Message):
-    cursor.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (message.from_user.id, message.from_user.username))
-    conn.commit()
-    await message.answer("✨ Xush kelibsiz! Instagram xizmatlaridan foydalanish uchun quyidagi bo'limlardan birini tanlang:", reply_markup=main_menu(message.from_user.id))
-
-@dp.message(F.text == "👤 Shaxsiy Kabinet / Balans")
-async def user_cabinet(message: types.Message):
-    cursor.execute("SELECT balance FROM users WHERE user_id=?", (message.from_user.id,))
-    balance = cursor.fetchone()[0]
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💰 Balansni to'ldirish", callback_data="user_deposit")]])
-    await message.answer(f"👤 *Sizning Shaxsiy Kabinetingiz:*\n\n🆔 ID: `{message.from_user.id}`\n💰 Balans: *{balance} so'm*", reply_markup=kb, parse_mode="Markdown")
-
-@dp.message(F.text == "📦 Mening buyurtmalarim")
-async def user_orders(message: types.Message):
-    cursor.execute("SELECT id, service, amount, status FROM orders WHERE user_id=? ORDER BY id DESC", (message.from_user.id,))
-    my_ords = cursor.fetchall()
-    if not my_ords:
-        await message.answer("ℹ️ Sizda hali hech qanday buyurtmalar maintuzilmagan.")
-        return
-    text = "📦 *Sizning buyurtmalaringiz ro'yxati:*\n\n"
-    for o_id, svc, amt, status in my_ords:
-        emoji = "⏳" if status == "Kutilmoqda" else ("🔄" if status == "Bajarilmoqda" else "✅")
-        text += f"{emoji} *Buyurtma #{o_id}*\n🛠 Xizmat: {svc.capitalize()}\n🔢 Miqdor: {amt} ta\n📊 Holat: *{status}*\n\n"
-    await message.answer(text, parse_mode="Markdown")
-
-@dp.callback_query(F.data == "user_deposit")
-async def user_deposit_start(call: types.CallbackQuery, state: FSMContext):
-    await call.message.answer("📥 To'ldirmoqchi bo'lgan miqdorni kiriting (so'mda):\n\n*(Jarayonni to'xtatish uchun pastdagi tugmani bosing)*", reply_markup=cancel_menu())
-    await state.set_state(UserStates.deposit_amount)
-
-@dp.message(UserStates.deposit_amount)
-async def user_deposit_amount_get(message: types.Message, state: FSMContext):
+def add_channel(message):
     try:
-        amount = float(message.text)
-        await state.update_data(dep_amount=amount)
-        cursor.execute("SELECT value FROM settings WHERE key='card'")
-        card = cursor.fetchone()[0]
-        pay_text = f"💳 *To'lov tizimi*\n\n💰 To'lov miqdori: *{amount} so'm*\n💳 Karta raqami: `{card}`\n\nTo'lovni amalga oshiring va *chek skrinshotini* shu yerga yuboring:"
-        await message.answer(pay_text, reply_markup=cancel_menu(), parse_mode="Markdown")
-        await state.set_state(UserStates.deposit_check)
+        parts = message.text.split()
+        ch_id = parts[0]
+        url = parts[1]
+        add_channel_db(ch_id, url)
+        bot.send_message(message.chat.id, "✅ Kanal majburiy obunalar ro'yxatiga qo'shildi!")
+    except Exception:
+        bot.send_message(message.chat.id, "❌ Xatolik! Formatni to'g'ri yozganingizga ishonch hosil qiling.")
+
+def delete_channel(message):
+    ch_id = message.text.strip()
+    delete_channel_db(ch_id)
+    bot.send_message(message.chat.id, "✅ Kanal muvaffaqiyatli o'chirildi!")
+
+def add_admin(message):
+    try:
+        new_admin_id = int(message.text.strip())
+        add_admin_db(new_admin_id)
+        bot.send_message(message.chat.id, f"✅ Foydalanuvchi ({new_admin_id}) muvaffaqiyatli admin qilindi!")
     except ValueError:
-        await message.answer("⚠️ Iltimos, faqat raqam kiriting:")
+        bot.send_message(message.chat.id, "❌ Xato ID kiritildi, faqat raqam kiriting.")
 
-@dp.message(UserStates.deposit_check, F.photo)
-async def user_deposit_check_get(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    photo_id = message.photo[-1].file_id
-    cursor.execute("INSERT INTO deposits (user_id, amount, photo_id, status) VALUES (?, ?, ?, 'Kutilmoqda')", (message.from_user.id, data['dep_amount'], photo_id))
-    conn.commit()
-    dep_id = cursor.lastrowid
-    await message.answer("⏳ Rahmat! Chekingiz adminga yuborildi. Tasdiqlangandan so'ng balansingiz to'ldiriladi.", reply_markup=main_menu(message.from_user.id))
-    await state.clear()
-    try: await bot.send_message(ADMIN_ID, f"🔔 *Yangi to'lov kutilmoqda #{dep_id}*\nFoydalanuvchi: {message.from_user.id}\nMiqdor: {data['dep_amount']} so'm\nTasdiqlash uchun Admin Paneldagi 'To'lovlar bo'limi'ga kiring.")
-    except: pass
+# --- TASDIQLASH TUGMASI (MAJBURIY OBUNA UCHUN) ---
+@bot.callback_query_handler(func=lambda call: call.data == "check_sub_status")
+def check_callback(call):
+    if check_sub(call.message.chat.id):
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+        bot.send_message(call.message.chat.id, "🎉 Rahmat! Obuna tasdiqlandi. Botdan foydalanishingiz mumkin.", reply_markup=main_keyboard())
+    else:
+        bot.answer_callback_query(call.id, "❌ Siz hali barcha kanallarga a'zo bo'lmadingiz!", show_alert=True)
 
-@dp.message(F.text.in_(["👤 Obunachi qo'shish", "❤️ Layk ko'paytirish", "👁 Ko'rishlarni ko'paytirish", "💬 Kommentariyalar"]))
-async def select_service(message: types.Message, state: FSMContext):
-    text = message.text
-    service_map = {
-        "👤 Obunachi qo'shish": "obunachi",
-        "❤️ Layk ko'paytirish": "layk",
-        "👁 Ko'rishlarni ko'paytirish": "korish",
-        "💬 Kommentariyalar": "komentariya"
-    }
-    service = service_map[text]
-    await state.update_data(user_service=service)
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[])
-    for amt in AMOUNTS:
-        price = calculate_price(service, amt)
-        label = f"{amt} ta" if amt < 1000 else f"{amt//1000}k"
-        kb.inline_keyboard.append([InlineKeyboardButton(text=f"{label} - {int(price)} so'm", callback_data=f"buy_{service}_{amt}")])
-        
-    await message.answer(f"✨ {text} bo'limi. Miqdorni tanlang:", reply_markup=kb)
-
-@dp.callback_query(F.data.startswith("buy_"))
-async def user_buy_select(call: types.CallbackQuery, state: FSMContext):
-    _, service, amount = call.data.split("_")
-    amount = int(amount)
-    price = calculate_price(service, amount)
-    
-    cursor.execute("SELECT balance FROM users WHERE user_id=?", (call.from_user.id,))
-    balance = cursor.fetchone()[0]
-    
-    if balance < price:
-        await call.answer("❌ Balansingizda mablag' yetarli emas! Iltimos, balansni to'ldiring.", show_alert=True)
+# --- NAKRUTKA INTEGRATSIYASI (NAMUNA MENYU) ---
+@bot.message_handler(func=lambda msg: True, content_types=['text'])
+def main_features(message):
+    add_user(message.chat.id)
+    if not check_sub(message.chat.id):
+        send_sub_keyboard(message)
         return
-        
-    await state.update_data(user_amount=amount, user_price=price)
-    await call.message.answer("🔗 Instagram profilingiz yoki postingiz havolasini (linkini) yuboring:", reply_markup=cancel_menu())
-    await state.set_state(UserStates.get_link)
 
-@dp.message(UserStates.get_link)
-async def user_link_get(message: types.Message, state: FSMContext):
-    if not message.text.startswith(("http://", "https://")):
-        await message.answer("⚠️ Iltimos, to'g'ri havola yuboring (https://...)")
-        return
+    if message.text == "🚀 Nakrutka buyurish":
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            types.InlineKeyboardButton(text="👥 Telegram Obunachi", callback_data="nak_tg"),
+            types.InlineKeyboardButton(text="👁 Telegram Ko'rishlar", callback_data="nak_view"),
+            types.InlineKeyboardButton(text="❤️ Instagram Layk", callback_data="nak_insta")
+        )
+        bot.send_message(message.chat.id, "👇 Kerakli xizmat turini tanlang:", reply_markup=markup)
         
-    data = await state.get_data()
-    price = data['user_price']
-    
-    cursor.execute("SELECT balance FROM users WHERE user_id=?", (message.from_user.id,))
-    balance = cursor.fetchone()[0]
-    if balance < price:
-        await message.answer("❌ Balansingizda mablag' yetarli emas!", reply_markup=main_menu(message.from_user.id))
-        await state.clear()
-        return
+    elif message.text == "💰 Balans":
+        bot.send_message(message.chat.id, "💳 Sizning balansingiz: <b>0 so'm</b>\n\nHisobni to'ldirish uchun adminga murojaat qiling.", parse_mode="HTML")
         
-    cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (price, message.from_user.id))
-    cursor.execute("INSERT INTO orders (user_id, service, amount, link, status) VALUES (?, ?, ?, ?, 'Kutilmoqda')",
-                   (message.from_user.id, data['user_service'], data['user_amount'], message.text))
-    conn.commit()
-    o_id = cursor.lastrowid
-    
-    await message.answer(f"✅ Buyurtma qabul qilindi! (Buyurtma ID: #{o_id})\n📦 {data['user_amount']} ta {data['user_service']} uchun balansingizdan {int(price)} so'm yechildi.\n\nJarayonni 'Mening buyurtmalarim' bo'limidan kuzatib borishingiz mumkin.", reply_markup=main_menu(message.from_user.id))
-    try: await bot.send_message(ADMIN_ID, f"🚀 *Yangi Nakrutka Buyurtmasi #{o_id}!*\n\n👤 Kimdan: {message.from_user.id}\n📦 Xizmat: {data['user_amount']} ta {data['user_service']}\n🔗 Link: {message.text}")
-    except: pass
-    await state.clear()
+    elif message.text == "📊 Buyurtmalarim":
+        bot.send_message(message.chat.id, "📦 Sizda hali faol buyurtmalar mavjud emas.")
+        
+    elif message.text == "ℹ️ Yordam":
+        bot.send_message(message.chat.id, "🤝 Savollar va takliflar uchun aloqa botimiz: @admin_username")
 
-async def main():
-    await dp.start_polling(bot)
+@bot.callback_query_handler(func=lambda call: call.data.startswith("nak_"))
+def nakrutka_callback(call):
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, "📝 Iltimos, havola (link) yuboring va miqdorni kiriting.\n*(Bu qismda o'z billing/provayder API-ingizni ulashingiz mumkin)*")
 
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+# --- BOTNI ISHGA TUSHIRISH ---
+keep_alive()  # Server o'chib qolmasligini ta'minlovchi Flask ishga tushadi
+print("Nakrutka boti muvaffaqiyatli ishga tushdi...")
+bot.infinity_polling()
